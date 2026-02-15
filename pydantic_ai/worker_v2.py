@@ -4,15 +4,19 @@ Worker–Critic v2: Two-Phase Executive-Summary Pipeline
 Designed for quantitative market-research with multi-study retrieval,
 segment metadata, and iterative exploration.
 
-Phase 1 — EXPLORE (accumulate findings across drill-downs)
-    Worker answers → Critic suggests deeper angle → findings APPEND to bank
-    Stops when: critic has no new angles OR max_explore iterations hit
+Phase 1 — EXPLORE with WHAT → WHY → HOW narrative arc
+    Stage 1 (WHAT):  Answer the core business question — top-line findings
+    Stage 2 (WHY):   Dig into drivers, segment differences, causal factors
+    Stage 3 (HOW):   Surface implications, recommendations, actionable angles
+    Critic steers the worker through these stages deliberately.
+    Findings ACCUMULATE with a depth tag; nothing is lost.
 
 Phase 2 — SYNTHESIZE & REFINE (polish one document)
-    Synthesizer merges ALL accumulated findings into one draft
+    Synthesizer merges ALL findings (organised by WHAT/WHY/HOW) into one draft
     Critic scores against rubric → Writer refines → repeat until approved
 
-This separates "discover more insights" from "make the document better".
+This separates "discover more insights" from "make the document better",
+and ensures the exploration follows the natural executive-summary narrative.
 """
 
 from __future__ import annotations
@@ -21,6 +25,8 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
+
+from enum import Enum
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
@@ -31,10 +37,21 @@ from pydantic_graph import BaseNode, End, Graph, GraphRunContext
 # ─────────────────────────────────────────────────────────
 
 
+class ExploreStage(str, Enum):
+    """The three narrative stages of executive-summary exploration."""
+
+    WHAT = "what"   # What is happening? (top-line findings, key metrics)
+    WHY = "why"     # Why is it happening? (drivers, segment splits, causation)
+    HOW = "how"     # How should business respond? (implications, actions)
+
+
 class Finding(BaseModel):
     """A single insight extracted from one exploration iteration."""
 
     claim: str = Field(description="The insight or finding statement")
+    depth: ExploreStage = Field(
+        description="Which narrative layer this finding serves: what / why / how"
+    )
     metric: Optional[str] = Field(
         default=None,
         description="Supporting quantitative data point, if available",
@@ -79,12 +96,28 @@ class CriticDirective(BaseModel):
     has_new_angle: bool = Field(
         description="True if there is a meaningful new angle to explore"
     )
+    next_stage: ExploreStage = Field(
+        description=(
+            "Which narrative stage the follow-up targets: "
+            "'what' (more top-line facts), 'why' (drivers/causation), "
+            "'how' (implications/actions)"
+        )
+    )
     follow_up_query: str = Field(
         default="",
-        description="The next drill-down question for the worker, if any",
+        description="The next question for the worker, scoped to next_stage",
     )
     rationale: str = Field(
         description="Why this angle matters for the executive summary"
+    )
+    what_coverage: str = Field(
+        description="Brief assessment: do we have enough WHAT findings?"
+    )
+    why_coverage: str = Field(
+        description="Brief assessment: do we have enough WHY findings?"
+    )
+    how_coverage: str = Field(
+        description="Brief assessment: do we have enough HOW findings?"
     )
     gaps_identified: List[str] = Field(
         default_factory=list,
@@ -153,10 +186,15 @@ explore_worker = Agent(
     output_type=ExplorationOutput,
     system_prompt=(
         "You are a quantitative market-research analyst with access to "
-        "multi-study survey data, segment metadata, and cross-tabulation tools. "
-        "Given a query and context about available studies/segments, produce a "
-        "structured set of findings. Each finding must cite a specific metric "
-        "and segment where possible. Flag any data gaps honestly."
+        "multi-study survey data, segment metadata, and cross-tabulation tools.\n\n"
+        "You will be told which narrative depth to focus on:\n"
+        "  - WHAT: Surface top-line findings, key metrics, headline numbers.\n"
+        "  - WHY:  Investigate drivers behind the WHAT — segment splits, "
+        "correlations, causal factors, regional differences.\n"
+        "  - HOW:  Surface strategic implications, competitive positioning, "
+        "actionable recommendations grounded in the data.\n\n"
+        "Tag each finding with the correct depth (what/why/how). "
+        "Cite specific metrics and segments. Flag data gaps honestly."
     ),
     model_settings={"temperature": 0.3},
 )
@@ -165,12 +203,21 @@ explore_critic = Agent(
     model=MODEL,
     output_type=CriticDirective,
     system_prompt=(
-        "You are a senior research director reviewing exploration progress. "
-        "You see: (a) the original business question, (b) all findings accumulated "
-        "so far, and (c) the available segments and studies not yet covered.\n\n"
-        "Your job: decide if there is a MEANINGFUL new angle that would strengthen "
-        "the executive summary. Do NOT suggest drill-downs for marginal value. "
-        "Set has_new_angle=False when the fact base is sufficient."
+        "You are a senior research director steering the exploration for an "
+        "executive summary. An executive summary must answer three layers:\n\n"
+        "  1. WHAT is happening? (top-line metrics, headline findings)\n"
+        "  2. WHY is it happening? (drivers, segment differences, causation)\n"
+        "  3. HOW should the business respond? (implications, recommendations)\n\n"
+        "You see all accumulated findings tagged by depth (what/why/how), "
+        "plus the segments and studies not yet explored.\n\n"
+        "Your job:\n"
+        "  - Assess coverage at each layer (what_coverage, why_coverage, how_coverage).\n"
+        "  - If WHAT is thin → ask a WHAT question first.\n"
+        "  - If WHAT is solid but WHY is thin → ask a WHY question.\n"
+        "  - If WHAT and WHY are solid but HOW is thin → ask a HOW question.\n"
+        "  - If all three layers have sufficient depth → set has_new_angle=False.\n\n"
+        "Do NOT skip layers. Do NOT suggest marginal drill-downs. "
+        "The goal is a well-rounded executive summary, not exhaustive analysis."
     ),
     model_settings={"temperature": 0.2},
 )
@@ -182,9 +229,16 @@ synthesizer = Agent(
     output_type=ExecutiveSummary,
     system_prompt=(
         "You are an executive-communications specialist. You receive a bank of "
-        "accumulated findings from multiple exploration passes. Your job:\n"
+        "accumulated findings tagged by depth: WHAT, WHY, and HOW.\n\n"
+        "Structure the executive summary to follow this natural narrative:\n"
+        "  - overview: Lead with the WHAT (what is happening — headline numbers)\n"
+        "  - key_findings: Mix of WHAT and WHY findings, each grounded in a metric\n"
+        "  - strategic_implications: Drawn from WHY and HOW findings\n"
+        "  - risks_and_caveats: From WHY findings + data gaps\n"
+        "  - recommended_actions: Drawn directly from HOW findings\n\n"
+        "Rules:\n"
         "  1. Merge and deduplicate findings across iterations.\n"
-        "  2. Write a concise, insight-driven executive summary (under 300 words).\n"
+        "  2. Keep the total summary under 300 words.\n"
         "  3. Ground every bullet in a specific metric.\n"
         "  4. If revision notes from a prior critique are provided, address each one.\n"
         "Use active voice, avoid jargon, lead with the 'so what'."
@@ -227,7 +281,8 @@ class PipelineState:
     available_segments: List[str] = field(default_factory=list)
 
     # --- Phase 1: Explore ---
-    current_query: str = ""           # query for the current explore iteration
+    current_query: str = ""            # query for the current explore iteration
+    current_stage: ExploreStage = ExploreStage.WHAT  # start with WHAT
     finding_bank: List[Finding] = field(default_factory=list)
     segments_covered: set = field(default_factory=set)
     studies_used: set = field(default_factory=set)
@@ -248,6 +303,20 @@ class PipelineState:
     def uncovered_studies(self) -> List[str]:
         return [s for s in self.available_studies if s not in self.studies_used]
 
+    def findings_by_stage(self) -> dict:
+        """Group findings by their narrative depth."""
+        grouped = {stage: [] for stage in ExploreStage}
+        for f in self.finding_bank:
+            grouped[f.depth].append(f)
+        return grouped
+
+    def stage_counts(self) -> dict:
+        """Count findings per narrative stage."""
+        counts = {stage.value: 0 for stage in ExploreStage}
+        for f in self.finding_bank:
+            counts[f.depth.value] += 1
+        return counts
+
 
 # ─────────────────────────────────────────────────────────
 # 4. Phase 1 nodes — EXPLORE
@@ -267,10 +336,34 @@ class ExploreWorker(BaseNode[PipelineState, None, ExecutiveSummary]):
         if not state.current_query:
             state.current_query = state.original_query
 
+        stage_instructions = {
+            ExploreStage.WHAT: (
+                "Focus on WHAT is happening. Surface top-line metrics, "
+                "headline numbers, key quantitative findings. "
+                "Tag findings with depth='what'."
+            ),
+            ExploreStage.WHY: (
+                "Focus on WHY things are happening. Investigate drivers, "
+                "segment differences, regional splits, correlations, and "
+                "causal factors behind the WHAT findings. "
+                "Tag findings with depth='why'."
+            ),
+            ExploreStage.HOW: (
+                "Focus on HOW the business should respond. Surface strategic "
+                "implications, competitive positioning insights, and "
+                "actionable recommendations grounded in the data. "
+                "Tag findings with depth='how'."
+            ),
+        }
+
         prompt = (
+            f"## Current Narrative Stage: {state.current_stage.value.upper()}\n"
+            f"{stage_instructions[state.current_stage]}\n\n"
             f"## Business Question\n{state.current_query}\n\n"
             f"## Available Studies\n{json.dumps(state.available_studies)}\n\n"
             f"## Available Segments\n{json.dumps(state.available_segments)}\n\n"
+            f"## Findings So Far (by stage)\n"
+            f"{json.dumps(state.stage_counts())}\n\n"
             f"## Already-Known Findings (avoid repeating these)\n"
             + (
                 json.dumps([f.model_dump() for f in state.finding_bank], indent=2)
@@ -291,10 +384,12 @@ class ExploreWorker(BaseNode[PipelineState, None, ExecutiveSummary]):
 
         state.history.append({
             "phase": "explore",
+            "stage": state.current_stage.value,
             "iteration": state.explore_count,
             "query": state.current_query,
             "new_findings": len(output.findings),
             "total_findings": len(state.finding_bank),
+            "stage_counts": state.stage_counts(),
         })
 
         return ExploreCritic()
@@ -302,7 +397,7 @@ class ExploreWorker(BaseNode[PipelineState, None, ExecutiveSummary]):
 
 @dataclass
 class ExploreCritic(BaseNode[PipelineState, None, ExecutiveSummary]):
-    """Critic decides: explore deeper, or move to synthesis."""
+    """Critic steers exploration through WHAT → WHY → HOW, then exits."""
 
     async def run(
         self, ctx: GraphRunContext[PipelineState]
@@ -314,13 +409,17 @@ class ExploreCritic(BaseNode[PipelineState, None, ExecutiveSummary]):
             state.history.append({
                 "phase": "explore_critic",
                 "decision": "max_iters_reached",
+                "stage_counts": state.stage_counts(),
                 "total_findings": len(state.finding_bank),
             })
             return SynthesizeDraft()
 
         prompt = (
             f"## Original Business Question\n{state.original_query}\n\n"
-            f"## Findings Accumulated So Far ({len(state.finding_bank)} total)\n"
+            f"## Current Exploration Stage: {state.current_stage.value.upper()}\n\n"
+            f"## Finding Counts by Narrative Layer\n"
+            f"{json.dumps(state.stage_counts(), indent=2)}\n\n"
+            f"## All Findings ({len(state.finding_bank)} total)\n"
             + json.dumps([f.model_dump() for f in state.finding_bank], indent=2)
             + f"\n\n## Segments NOT yet explored\n"
             + json.dumps(state.uncovered_segments())
@@ -336,16 +435,24 @@ class ExploreCritic(BaseNode[PipelineState, None, ExecutiveSummary]):
         state.history.append({
             "phase": "explore_critic",
             "iteration": state.explore_count,
+            "previous_stage": state.current_stage.value,
+            "next_stage": directive.next_stage.value,
             "has_new_angle": directive.has_new_angle,
             "follow_up": directive.follow_up_query,
             "rationale": directive.rationale,
+            "coverage": {
+                "what": directive.what_coverage,
+                "why": directive.why_coverage,
+                "how": directive.how_coverage,
+            },
         })
 
         if not directive.has_new_angle:
-            # Exploration is sufficient → move to Phase 2
+            # All three layers sufficiently covered → move to Phase 2
             return SynthesizeDraft()
 
-        # Feed the follow-up as the next explore query
+        # Advance the stage and feed the follow-up query
+        state.current_stage = directive.next_stage
         state.current_query = directive.follow_up_query
         return ExploreWorker()
 
@@ -364,10 +471,16 @@ class SynthesizeDraft(BaseNode[PipelineState, None, ExecutiveSummary]):
     ) -> "RefineCritic":
         state = ctx.state
 
+        # Organize findings by narrative depth for the synthesizer
+        by_stage = state.findings_by_stage()
         prompt_parts = [
             f"## Original Business Question\n{state.original_query}\n",
-            f"## Complete Finding Bank ({len(state.finding_bank)} findings)\n"
-            + json.dumps([f.model_dump() for f in state.finding_bank], indent=2),
+            f"## WHAT Findings (top-line, {len(by_stage[ExploreStage.WHAT])} items)\n"
+            + json.dumps([f.model_dump() for f in by_stage[ExploreStage.WHAT]], indent=2),
+            f"\n## WHY Findings (drivers/causation, {len(by_stage[ExploreStage.WHY])} items)\n"
+            + json.dumps([f.model_dump() for f in by_stage[ExploreStage.WHY]], indent=2),
+            f"\n## HOW Findings (implications/actions, {len(by_stage[ExploreStage.HOW])} items)\n"
+            + json.dumps([f.model_dump() for f in by_stage[ExploreStage.HOW]], indent=2),
             f"\n## Data Gaps to Acknowledge\n"
             + json.dumps(list(set(state.data_gaps))),
         ]
@@ -491,9 +604,13 @@ async def main() -> None:
         print(f"  → {a}")
 
     # --- Pipeline stats ---
+    counts = state.stage_counts()
     print(f"\n{'─' * 70}")
     print(f"Exploration iters : {state.explore_count}")
-    print(f"Findings collected: {len(state.finding_bank)}")
+    print(f"Findings collected: {len(state.finding_bank)} total")
+    print(f"  WHAT findings   : {counts['what']}")
+    print(f"  WHY  findings   : {counts['why']}")
+    print(f"  HOW  findings   : {counts['how']}")
     print(f"Segments covered  : {state.segments_covered}")
     print(f"Refine iters      : {state.refine_count}")
     print(f"Final score       : {state.verdict.score}/10  "
